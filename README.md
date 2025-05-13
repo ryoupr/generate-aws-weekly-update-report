@@ -79,19 +79,26 @@ npm run deploy
 ```mermaid
 graph LR
     A[AWS RSSフィード] --> B(Lambda関数);
-    B --> C{Slack};
+    B --> C{S3};
+    C --> D(Lambda関数);
+    D --> E{Slack};
     style A fill:#f9f,stroke:#333,stroke-width:2px
     style B fill:#ccf,stroke:#333,stroke-width:2px
     style C fill:#fcc,stroke:#333,stroke-width:2px
+    style D fill:#ccf,stroke:#333,stroke-width:2px
+    style E fill:#fcc,stroke:#333,stroke-width:2px
 ```
 
 このアーキテクチャ図は、AWS の週次アップデート情報を収集し、Slack に通知するシステムの概要を示しています。
 
 - AWS RSSフィード: AWS の最新情報が掲載された RSS フィードです。
-- Lambda関数: RSS フィードから情報を収集し、Slack に通知する AWS Lambda 関数です。
+- Lambda関数: RSS フィードから情報を収集し、S3に格納する AWS Lambda 関数です。
+- S3: 収集された情報を格納する AWS Simple Storage Service (S3) バケットです。
+- Lambda関数: S3に格納された情報をSlackに通知する AWS Lambda 関数です。
 - Slack: 収集された情報が通知される Slack チャンネルです。
 
-Lambda 関数は、定期的に AWS RSS フィードをポーリングし、新しい情報があれば Slack に通知します。
+1つ目のLambda関数は、定期的に AWS RSS フィードをポーリングし、新しい情報があれば S3 バケットに格納します。
+2つ目のLambda関数は、S3 バケットに新しい情報が格納されると、Slack に通知します。
 
 ## 貢献方法
 
