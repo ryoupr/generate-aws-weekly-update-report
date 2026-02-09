@@ -2,12 +2,17 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { PythonFunction } from '@aws-cdk/aws-lambda-python-alpha'; // PythonFunction用 (PythonLayerVersion は未使用なので削除)
+import { PythonFunction } from '@aws-cdk/aws-lambda-python-alpha';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
-import * as s3 from 'aws-cdk-lib/aws-s3'; // S3モジュールをインポート
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as path from 'path';
-import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources'; // S3イベントソース用に追加
+import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
 
 export interface AwsWeeklyReportCdkStackProps extends cdk.StackProps {
   /**
@@ -67,6 +72,11 @@ export interface AwsWeeklyReportCdkStackProps extends cdk.StackProps {
    * @default 3600 (1 hour)
    */
   readonly presignedUrlExpirationSeconds?: number; // Slack通知用に追加
+
+  /**
+   * Email address for CloudWatch Alarm notifications.
+   */
+  readonly alertEmail?: string;
 }
 
 export class AwsWeeklyReportCdkStack extends cdk.Stack {
@@ -115,12 +125,18 @@ export class AwsWeeklyReportCdkStack extends cdk.Stack {
       actions: ['translate:TranslateText'],
       resources: ['*'], // TranslateTextは特定リソースへの制限が難しいためワイルドカードを使用
     }));
+
+    // DLQ for RSS Lambda
+    const rssLambdaDlq = new sqs.Queue(this, 'RssLambdaDlq', {
+      queueName: `${lambdaFunctionName}-DLQ`,
+      retentionPeriod: cdk.Duration.days(14),
+    });
     
     // Lambda Function (using PythonFunction for automatic dependency bundling)
     const weeklyReportFunction = new PythonFunction(this, 'WeeklyReportLambda', {
       functionName: lambdaFunctionName,
       entry: path.join(__dirname, '../lambda'), // Path to the lambda directory
-      runtime: lambda.Runtime.PYTHON_3_9,
+      runtime: lambda.Runtime.PYTHON_3_12,
       index: 'update_report_from_rss_lambda.py', // Name of the Python file (WITH .py)
       handler: 'lambda_handler', // Name of the handler function
       role: lambdaRole,
@@ -131,6 +147,8 @@ export class AwsWeeklyReportCdkStack extends cdk.Stack {
       },
       timeout: lambdaTimeout,
       memorySize: lambdaMemory,
+      deadLetterQueue: rssLambdaDlq,
+      retryAttempts: 2,
       bundling: {
         // If you have specific Docker options or build arguments
         // dockerOptions: {
@@ -196,11 +214,17 @@ export class AwsWeeklyReportCdkStack extends cdk.Stack {
       resources: [reportBucket.arnForObjects(`${reportOutputS3KeyPrefix}*`)],
     }));
 
+    // DLQ for S3 to Slack Notifier Lambda
+    const slackNotifierDlq = new sqs.Queue(this, 'SlackNotifierDlq', {
+      queueName: `${s3ToSlackNotifierFunctionName}-DLQ`,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     // S3 to Slack Notifier Lambda Function
     const s3ToSlackNotifierFunction = new PythonFunction(this, 'S3ToSlackNotifierLambda', {
       functionName: s3ToSlackNotifierFunctionName, // 更新された関数名を使用
       entry: path.join(__dirname, '../lambda'),
-      runtime: lambda.Runtime.PYTHON_3_9,
+      runtime: lambda.Runtime.PYTHON_3_12,
       index: 's3_to_slack_notifier_lambda.py',
       handler: 'lambda_handler',
       role: s3ToSlackNotifierRole,
@@ -211,6 +235,8 @@ export class AwsWeeklyReportCdkStack extends cdk.Stack {
       },
       timeout: cdk.Duration.seconds(30),
       memorySize: 128,
+      deadLetterQueue: slackNotifierDlq,
+      retryAttempts: 2,
     });
 
     // Add S3 event notification to trigger the S3ToSlackNotifierLambda
@@ -242,5 +268,47 @@ export class AwsWeeklyReportCdkStack extends cdk.Stack {
       value: s3ToSlackNotifierRole.roleArn,
       description: 'ARN of the IAM role for the S3 to Slack Notifier Lambda function',
     });
+
+    // --- CloudWatch Alarms ---
+    if (props.alertEmail) {
+      const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
+        topicName: `${lambdaFunctionName}-Alarms`,
+      });
+      alarmTopic.addSubscription(new snsSubscriptions.EmailSubscription(props.alertEmail));
+
+      // Lambda Errors Alarms
+      weeklyReportFunction.metricErrors({ period: cdk.Duration.minutes(5) })
+        .createAlarm(this, 'RssLambdaErrorAlarm', {
+          alarmName: `${lambdaFunctionName}-Errors`,
+          threshold: 1,
+          evaluationPeriods: 1,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        }).addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+
+      s3ToSlackNotifierFunction.metricErrors({ period: cdk.Duration.minutes(5) })
+        .createAlarm(this, 'SlackNotifierErrorAlarm', {
+          alarmName: `${s3ToSlackNotifierFunctionName}-Errors`,
+          threshold: 1,
+          evaluationPeriods: 1,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        }).addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+
+      // DLQ Alarms
+      rssLambdaDlq.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(5) })
+        .createAlarm(this, 'RssLambdaDlqAlarm', {
+          alarmName: `${lambdaFunctionName}-DLQ-Messages`,
+          threshold: 1,
+          evaluationPeriods: 1,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        }).addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+
+      slackNotifierDlq.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(5) })
+        .createAlarm(this, 'SlackNotifierDlqAlarm', {
+          alarmName: `${s3ToSlackNotifierFunctionName}-DLQ-Messages`,
+          threshold: 1,
+          evaluationPeriods: 1,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        }).addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+    }
   }
 }

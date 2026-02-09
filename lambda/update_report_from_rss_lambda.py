@@ -1,10 +1,13 @@
 # update_report_from_rss_lambda.py (AWS Lambda対応版)
-# (これは以前作成した scripts/update_report_from_rss_lambda.py と同じ内容じゃ)
 import feedparser
 import os
 import boto3
+import logging
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # --- 設定 (Lambda環境変数から取得することを推奨) ---
 RSS_FEED_URL = os.environ.get(
@@ -89,7 +92,7 @@ def generate_report_content(entries_by_date, start_date_obj, end_date_obj):
                 )
                 translated_title = translate_response.get("TranslatedText", entry["title"])
             except Exception as e:
-                print(f"翻訳エラー: {entry['title']} - {e}")
+                logger.warning(f"翻訳エラー: {entry['title']} - {e}")
                 translated_title = entry["title"] # エラー時は元のタイトルを使用
 
             escaped_title = (
@@ -111,10 +114,10 @@ def generate_report_content(entries_by_date, start_date_obj, end_date_obj):
 
 
 def lambda_handler(event, context):
-    print("処理開始...")
+    logger.info("処理開始...")
 
     if not S3_BUCKET_NAME:
-        print("エラー: 環境変数 S3_BUCKET_NAME が設定されていません。")
+        logger.error("環境変数 S3_BUCKET_NAME が設定されていません。")
         return {"statusCode": 500, "body": "S3_BUCKET_NAME is not set"}
 
     today = datetime.now(JST)
@@ -122,29 +125,26 @@ def lambda_handler(event, context):
         get_previous_week_dates(today)
     )
 
-    print(
+    logger.info(
         f"対象週: {prev_monday.strftime('%Y/%m/%d')} - "
         f"{prev_sunday.strftime('%Y/%m/%d')}"
     )
-    rss_feed_message = (
-        f"AWS What's New RSSフィード ({RSS_FEED_URL}) を取得中..."
-    )
-    print(rss_feed_message)
+    logger.info(f"AWS What's New RSSフィード ({RSS_FEED_URL}) を取得中...")
     feed = feedparser.parse(RSS_FEED_URL)
 
     if feed.bozo:
-        print(
-            f"警告: RSSフィードの解析に問題がある可能性があります: {feed.bozo_exception}"
+        logger.warning(
+            f"RSSフィードの解析に問題がある可能性があります: {feed.bozo_exception}"
         )
 
     if not feed.entries:
-        print("エラー: RSSフィードからエントリを取得できませんでした。")
+        logger.error("RSSフィードからエントリを取得できませんでした。")
         return {
             "statusCode": 500,
             "body": "Failed to retrieve RSS feed entries",
         }
 
-    print(f"{len(feed.entries)} 件のエントリを処理します...")
+    logger.info(f"{len(feed.entries)} 件のエントリを処理します...")
 
     entries_for_last_week = defaultdict(list)
     processed_count = 0
@@ -162,13 +162,13 @@ def lambda_handler(event, context):
             processed_count += 1
 
     if not entries_for_last_week:
-        print("先週公開された新しいエントリは見つかりませんでした。")
+        logger.info("先週公開された新しいエントリは見つかりませんでした。")
         return {
             "statusCode": 200,
             "body": "No new entries found for the last week.",
         }
 
-    print(
+    logger.info(
         f"先週のエントリを {processed_count} 件見つけました。"
         "レポートファイルを生成します..."
     )
@@ -191,12 +191,12 @@ def lambda_handler(event, context):
             Body=report_content,
             ContentType="text/markdown; charset=utf-8",
         )
-        print(
+        logger.info(
             f"レポートファイルをS3にアップロードしました: s3://{S3_BUCKET_NAME}/{s3_key}"
         )
     except Exception as e:
-        print(
-            f"エラー: S3へのファイルアップロード中にエラーが発生しました "
+        logger.error(
+            f"S3へのファイルアップロード中にエラーが発生しました "
             f"(s3://{S3_BUCKET_NAME}/{s3_key}): {e}"
         )
         return {
@@ -204,7 +204,7 @@ def lambda_handler(event, context):
             "body": f"Error uploading to S3: {e}",
         }
 
-    print("\n処理完了。")
+    logger.info("処理完了。")
     return {
         "statusCode": 200,
         "body": (

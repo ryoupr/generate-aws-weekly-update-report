@@ -15,6 +15,8 @@ logger.setLevel(logging.INFO)
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 # 署名付きURLの有効期限（秒）
 PRESIGNED_URL_EXPIRATION = int(os.environ.get('PRESIGNED_URL_EXPIRATION', 604800))  # デフォルト7日間 (7*24*60*60 = 604800)
+# S3キープレフィックス
+S3_KEY_PREFIX = os.environ.get('S3_KEY_PREFIX', 'reports/')
 
 http = urllib3.PoolManager()
 s3_client = boto3.client('s3')
@@ -63,10 +65,9 @@ def lambda_handler(event, context):
 
             logger.info(f"Processing object s3://{bucket_name}/{object_key}")
 
-            # /report/ プレフィックスでフィルタリング (S3イベント通知側でも設定するが念のため)
-            # S3イベント通知のプレフィックス設定が report/ の場合、object_key は report/filename.md のようになる
-            if not object_key.startswith('report/'): # 環境変数 S3_KEY_PREFIX を参照しても良い
-                 logger.info(f"Object {object_key} does not match prefix 'report/'. Skipping.")
+            # S3_KEY_PREFIX でフィルタリング (S3イベント通知側でも設定するが念のため)
+            if not object_key.startswith(S3_KEY_PREFIX):
+                 logger.info(f"Object {object_key} does not match prefix '{S3_KEY_PREFIX}'. Skipping.")
                  continue
 
             # オブジェクトのメタデータを取得
